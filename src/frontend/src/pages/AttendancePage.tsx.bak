@@ -1,0 +1,656 @@
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  CheckCircle2,
+  Download,
+  Loader2,
+  Upload,
+  Users,
+  XCircle,
+} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import type { Attendance } from "../backend";
+import { useActor } from "../hooks/useActor";
+import { useAppAuth } from "../hooks/useAppAuth";
+
+const SKELETON_KEYS = ["sk1", "sk2", "sk3", "sk4", "sk5"];
+
+function todayStr() {
+  return new Date().toISOString().split("T")[0];
+}
+
+/** Parse a single CSV line handling quoted fields */
+function parseCSVLine(line: string): string[] {
+  const result: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (ch === "," && !inQuotes) {
+      result.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+
+const SHIFT_LABELS: Record<string, string> = {
+  A: "Shift A (6AM–2PM)",
+  B: "Shift B (2PM–10PM)",
+  C: "Shift C (10PM–6AM)",
+  D: "Shift D (Custom)",
+};
+const SHIFT_BADGE_CLASSES: Record<string, string> = {
+  A: "bg-blue-100 text-blue-700",
+  B: "bg-cyan-100 text-cyan-700",
+  C: "bg-purple-100 text-purple-700",
+  D: "bg-amber-100 text-amber-700",
+};
+
+export default function AttendancePage() {
+  const { actor, isFetching } = useActor();
+  const { user } = useAppAuth();
+  const qc = useQueryClient();
+  const [date, setDate] = useState(todayStr());
+  const [saving, setSaving] = useState<Set<string>>(new Set());
+  const [inTimeInputs, setInTimeInputs] = useState<Record<string, string>>({});
+  const [outTimeInputs, setOutTimeInputs] = useState<Record<string, string>>(
+    {},
+  );
+  const csvInputRef = useRef<HTMLInputElement>(null);
+  const [importing, setImporting] = useState(false);
+
+  const canEdit = user?.permissions === "edit";
+
+  const { data: employees = [], isLoading: empLoading } = useQuery({
+    queryKey: ["employees"],
+    queryFn: () => actor!.getAllEmployees(),
+    enabled: !!actor && !isFetching,
+  });
+
+  const { data: vendors = [] } = useQuery({
+    queryKey: ["vendors"],
+    queryFn: () => actor!.getAllVendors(),
+    enabled: !!actor && !isFetching,
+  });
+
+  const vendorMap = Object.fromEntries(vendors.map((v) => [v.id, v.name]));
+
+  const { data: attendance = [], isLoading: attLoading } = useQuery({
+    queryKey: ["attendance", date],
+    queryFn: () => actor!.getAttendanceByDate(date) as Promise<Attendance[]>,
+    enabled: !!actor && !isFetching,
+  });
+
+  const attendanceMap = useMemo(
+    () => Object.fromEntries(attendance.map((a) => [a.employeeId, a])),
+    [attendance],
+  );
+
+  useEffect(() => {
+    const newIn: Record<string, string> = {};
+    const newOut: Record<string, string> = {};
+    for (const a of attendance) {
+      newIn[a.employeeId] = a.inTime || "";
+      newOut[a.employeeId] = a.outTime || "";
+    }
+    setInTimeInputs(newIn);
+    setOutTimeInputs(newOut);
+  }, [attendance]);
+
+  async function saveTimesOnBlur(employeeId: string) {
+    const att = attendanceMap[employeeId];
+    if (!att || !canEdit) return;
+    const record = {
+      ...att,
+      inTime: inTimeInputs[employeeId] ?? "",
+      outTime: outTimeInputs[employeeId] ?? "",
+      shift: (att as any).shift ?? "",
+    } as Attendance;
+    await actor!.updateAttendance(record);
+    await qc.invalidateQueries({ queryKey: ["attendance", date] });
+  }
+
+  async function markStatus(employeeId: string, status: string) {
+    if (!actor || !canEdit) return;
+    setSaving((prev) => new Set(prev).add(employeeId));
+    try {
+      const existing = attendanceMap[employeeId];
+      const record = {
+        id: existing?.id ?? crypto.randomUUID(),
+        employeeId,
+        date,
+        status,
+        inTime: inTimeInputs[employeeId] ?? "",
+        outTime: outTimeInputs[employeeId] ?? "",
+        shift: (existing as any)?.shift ?? "",
+      } as Attendance;
+      if (existing) {
+        await actor.updateAttendance(record);
+      } else {
+        await actor.markAttendance(record);
+      }
+      await qc.invalidateQueries({ queryKey: ["attendance", date] });
+      toast.success(`Marked ${status}`);
+    } catch {
+      toast.error("Failed to mark attendance");
+    } finally {
+      setSaving((prev) => {
+        const s = new Set(prev);
+        s.delete(employeeId);
+        return s;
+      });
+    }
+  }
+
+  async function markAll(status: string) {
+    if (!actor || !canEdit) return;
+    const promises = employees.map(async (emp) => {
+      const existing = attendanceMap[emp.id];
+      const record = {
+        id: existing?.id ?? crypto.randomUUID(),
+        employeeId: emp.id,
+        date,
+        status,
+        inTime: inTimeInputs[emp.id] ?? "",
+        outTime: outTimeInputs[emp.id] ?? "",
+        shift: (existing as any)?.shift ?? "",
+      } as Attendance;
+      if (existing) {
+        return actor.updateAttendance(record);
+      }
+      return actor.markAttendance(record);
+    });
+    try {
+      await Promise.all(promises);
+      await qc.invalidateQueries({ queryKey: ["attendance", date] });
+      toast.success(`All employees marked ${status}`);
+    } catch {
+      toast.error("Failed to mark all attendance");
+    }
+  }
+
+  // Generate CSV of current attendance
+  function generateCSV() {
+    const rows: string[] = [
+      "Employee Code,Employee Name,Company,Date,In Time,Out Time,Status",
+    ];
+    for (const emp of employees) {
+      const att = attendanceMap[emp.id];
+      rows.push(
+        [
+          emp.code,
+          `"${emp.name}"`,
+          `"${vendorMap[emp.vendorId] ?? ""}"`,
+          date,
+          inTimeInputs[emp.id] ?? "",
+          outTimeInputs[emp.id] ?? "",
+          att?.status ?? "Not Marked",
+        ].join(","),
+      );
+    }
+    const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `attendance_${date}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success("CSV generated and downloaded");
+  }
+
+  // Import CSV: detect columns by header names, determine Present/Absent by in/out time
+  async function handleCSVImport(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file || !actor || !canEdit) return;
+    setImporting(true);
+    try {
+      const text = await file.text();
+      const lines = text.trim().split(/\r?\n/);
+      if (lines.length < 2) {
+        toast.error("CSV file is empty or has no data rows");
+        return;
+      }
+
+      // Parse header row to find column indices flexibly
+      const headers = parseCSVLine(lines[0]).map((h) => h.toLowerCase());
+      const codeIdx = headers.findIndex((h) => h.includes("code"));
+      const inIdx = headers.findIndex(
+        (h) => h === "in time" || (h.startsWith("in") && !h.includes("out")),
+      );
+      const outIdx = headers.findIndex((h) => h.includes("out"));
+
+      if (codeIdx === -1) {
+        toast.error("CSV must have an 'Employee Code' column");
+        return;
+      }
+
+      // Build code -> employee map (case-insensitive)
+      const codeMap: Record<string, (typeof employees)[0]> = {};
+      for (const emp of employees) {
+        codeMap[emp.code.trim().toLowerCase()] = emp;
+      }
+
+      let successCount = 0;
+      let skippedCount = 0;
+      let errorCount = 0;
+      let firstErrorMsg = "";
+
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        const cols = parseCSVLine(line);
+
+        const employeeCode = (cols[codeIdx] ?? "").trim().toLowerCase();
+        const inTime = inIdx >= 0 ? (cols[inIdx] ?? "").trim() : "";
+        const outTime = outIdx >= 0 ? (cols[outIdx] ?? "").trim() : "";
+
+        const emp = codeMap[employeeCode];
+        if (!emp) {
+          skippedCount++;
+          continue;
+        }
+
+        // Determine status: Present if any in/out time provided, else Absent
+        const status = inTime || outTime ? "Present" : "Absent";
+
+        const existing = attendanceMap[emp.id];
+        const record = {
+          id: existing?.id ?? crypto.randomUUID(),
+          employeeId: emp.id,
+          date,
+          status,
+          inTime,
+          outTime,
+          shift: (existing as any)?.shift ?? "",
+        } as Attendance;
+
+        try {
+          if (existing) {
+            await actor.updateAttendance(record);
+          } else {
+            await actor.markAttendance(record);
+          }
+          successCount++;
+        } catch (err) {
+          errorCount++;
+          if (!firstErrorMsg) {
+            firstErrorMsg = err instanceof Error ? err.message : String(err);
+          }
+        }
+      }
+
+      // Mark employees NOT found in the CSV as Absent
+      const processedCodes = new Set(
+        Array.from({ length: lines.length - 1 }, (_, i) => {
+          const cols = parseCSVLine(lines[i + 1]);
+          return (cols[codeIdx] ?? "").trim().toLowerCase();
+        }),
+      );
+      for (const emp of employees) {
+        if (!processedCodes.has(emp.code.trim().toLowerCase())) {
+          const existing = attendanceMap[emp.id];
+          const record = {
+            id: existing?.id ?? crypto.randomUUID(),
+            employeeId: emp.id,
+            date,
+            status: "Absent",
+            inTime: "",
+            outTime: "",
+            shift: (existing as any)?.shift ?? "",
+          } as Attendance;
+          try {
+            if (existing) {
+              await actor.updateAttendance(record);
+            } else {
+              await actor.markAttendance(record);
+            }
+          } catch {
+            // best effort
+          }
+        }
+      }
+
+      await qc.invalidateQueries({ queryKey: ["attendance", date] });
+
+      if (successCount === 0 && errorCount > 0) {
+        toast.error(`Import failed: ${firstErrorMsg || "Unknown error"}`);
+      } else {
+        const parts: string[] = [`Imported ${successCount} record(s).`];
+        if (skippedCount > 0)
+          parts.push(`Skipped ${skippedCount} (employee code not found).`);
+        if (errorCount > 0) parts.push(`${errorCount} row(s) failed.`);
+        toast.success(parts.join(" "));
+      }
+    } catch {
+      toast.error("Failed to import CSV");
+    } finally {
+      setImporting(false);
+      if (csvInputRef.current) csvInputRef.current.value = "";
+    }
+  }
+
+  const isLoading = empLoading || attLoading;
+  const presentCount = attendance.filter((a) => a.status === "Present").length;
+  const absentCount = attendance.filter((a) => a.status === "Absent").length;
+
+  return (
+    <div className="space-y-5">
+      <Card className="shadow-card border-border">
+        <CardHeader className="pb-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-3">
+                <CardTitle className="text-base font-semibold">
+                  Daily Attendance
+                </CardTitle>
+                {!canEdit && (
+                  <Badge variant="secondary" className="text-xs">
+                    Read Only
+                  </Badge>
+                )}
+              </div>
+              <div className="flex gap-3 mt-1.5">
+                <span className="text-xs text-muted-foreground">
+                  <span className="font-semibold text-green-600">
+                    {presentCount}
+                  </span>{" "}
+                  Present
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  <span className="font-semibold text-red-500">
+                    {absentCount}
+                  </span>{" "}
+                  Absent
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  <span className="font-semibold text-foreground">
+                    {employees.length - presentCount - absentCount}
+                  </span>{" "}
+                  Not Marked
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <Input
+                data-ocid="attendance.date.input"
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                className="w-40 h-9 text-sm bg-card"
+              />
+              {/* Generate CSV */}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-9 text-xs gap-1.5"
+                onClick={generateCSV}
+                disabled={employees.length === 0}
+              >
+                <Download className="h-3.5 w-3.5" /> Generate CSV
+              </Button>
+              {/* Import CSV */}
+              {canEdit && (
+                <>
+                  <input
+                    ref={csvInputRef}
+                    type="file"
+                    accept=".csv"
+                    className="hidden"
+                    onChange={handleCSVImport}
+                  />
+                  <Button
+                    data-ocid="attendance.import_csv.button"
+                    size="sm"
+                    variant="outline"
+                    className="h-9 text-xs gap-1.5"
+                    onClick={() => csvInputRef.current?.click()}
+                    disabled={importing}
+                  >
+                    {importing ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Upload className="h-3.5 w-3.5" />
+                    )}
+                    Import CSV
+                  </Button>
+                  <Button
+                    data-ocid="attendance.mark_all_present.button"
+                    size="sm"
+                    variant="outline"
+                    className="h-9 text-xs gap-1.5 border-green-200 text-green-700 hover:bg-green-50"
+                    onClick={() => markAll("Present")}
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" /> All Present
+                  </Button>
+                  <Button
+                    data-ocid="attendance.mark_all_absent.button"
+                    size="sm"
+                    variant="outline"
+                    className="h-9 text-xs gap-1.5 border-red-200 text-red-600 hover:bg-red-50"
+                    onClick={() => markAll("Absent")}
+                  >
+                    <XCircle className="h-3.5 w-3.5" /> All Absent
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* CSV Format hint */}
+          <div className="mt-3 p-2.5 bg-muted/50 rounded text-xs text-muted-foreground">
+            <span className="font-semibold">CSV Import Format:</span>{" "}
+            <span className="font-mono">
+              Employee Code, Employee Name, In Time, Out Time
+            </span>{" "}
+            — employees with in/out time are marked{" "}
+            <span className="text-green-600 font-semibold">Present</span>,
+            others marked{" "}
+            <span className="text-red-500 font-semibold">Absent</span>
+          </div>
+        </CardHeader>
+        <CardContent className="p-0">
+          {isLoading ? (
+            <div className="p-6 space-y-3" data-ocid="attendance.loading_state">
+              {SKELETON_KEYS.map((k) => (
+                <Skeleton key={k} className="h-10 w-full" />
+              ))}
+            </div>
+          ) : employees.length === 0 ? (
+            <div
+              data-ocid="attendance.empty_state"
+              className="py-16 text-center"
+            >
+              <Users className="h-10 w-10 text-muted-foreground mx-auto mb-3" />
+              <p className="text-sm text-muted-foreground">
+                No employees to mark attendance for.
+              </p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto" data-ocid="attendance.table">
+              <Table>
+                <TableHeader>
+                  <TableRow className="bg-muted/50">
+                    <TableHead className="text-xs font-semibold">
+                      Employee
+                    </TableHead>
+                    <TableHead className="text-xs font-semibold">
+                      Code
+                    </TableHead>
+                    <TableHead className="text-xs font-semibold">
+                      Company
+                    </TableHead>
+                    <TableHead className="text-xs font-semibold">
+                      Shift
+                    </TableHead>
+                    <TableHead className="text-xs font-semibold">
+                      In Time
+                    </TableHead>
+                    <TableHead className="text-xs font-semibold">
+                      Out Time
+                    </TableHead>
+                    <TableHead className="text-xs font-semibold">
+                      Status
+                    </TableHead>
+                    {canEdit && (
+                      <TableHead className="text-xs font-semibold text-right">
+                        Action
+                      </TableHead>
+                    )}
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {employees.map((emp, idx) => {
+                    const att = attendanceMap[emp.id];
+                    const status = att?.status;
+                    const isSavingThis = saving.has(emp.id);
+                    return (
+                      <TableRow
+                        key={emp.id}
+                        data-ocid={`attendance.item.${idx + 1}`}
+                      >
+                        <TableCell className="font-medium text-sm">
+                          {emp.name}
+                        </TableCell>
+                        <TableCell className="text-sm text-muted-foreground font-mono">
+                          {emp.code}
+                        </TableCell>
+                        <TableCell className="text-sm">
+                          {vendorMap[emp.vendorId] ?? "\u2014"}
+                        </TableCell>
+                        <TableCell>
+                          {emp.shift ? (
+                            <span
+                              className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${SHIFT_BADGE_CLASSES[emp.shift] ?? "bg-gray-100 text-gray-700"}`}
+                            >
+                              {SHIFT_LABELS[emp.shift] ?? emp.shift}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground text-xs">
+                              —
+                            </span>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          <Input
+                            data-ocid={`attendance.in_time.input.${idx + 1}`}
+                            type="time"
+                            value={inTimeInputs[emp.id] ?? ""}
+                            onChange={(e) =>
+                              setInTimeInputs((prev) => ({
+                                ...prev,
+                                [emp.id]: e.target.value,
+                              }))
+                            }
+                            onBlur={() => saveTimesOnBlur(emp.id)}
+                            disabled={!canEdit}
+                            className="w-28 h-7 text-xs"
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <Input
+                            data-ocid={`attendance.out_time.input.${idx + 1}`}
+                            type="time"
+                            value={outTimeInputs[emp.id] ?? ""}
+                            onChange={(e) =>
+                              setOutTimeInputs((prev) => ({
+                                ...prev,
+                                [emp.id]: e.target.value,
+                              }))
+                            }
+                            onBlur={() => saveTimesOnBlur(emp.id)}
+                            disabled={!canEdit}
+                            className="w-28 h-7 text-xs"
+                          />
+                        </TableCell>
+                        <TableCell>
+                          {status === "Present" ? (
+                            <Badge className="bg-green-100 text-green-700 hover:bg-green-100 border-0 text-xs">
+                              Present
+                            </Badge>
+                          ) : status === "Absent" ? (
+                            <Badge className="bg-red-100 text-red-600 hover:bg-red-100 border-0 text-xs">
+                              Absent
+                            </Badge>
+                          ) : (
+                            <Badge variant="secondary" className="text-xs">
+                              Not Marked
+                            </Badge>
+                          )}
+                        </TableCell>
+                        {canEdit && (
+                          <TableCell className="text-right">
+                            <div className="flex justify-end gap-1">
+                              <Button
+                                data-ocid={`attendance.present.button.${idx + 1}`}
+                                size="sm"
+                                variant={
+                                  status === "Present" ? "default" : "outline"
+                                }
+                                className={`h-7 text-xs px-2.5 ${
+                                  status === "Present"
+                                    ? "bg-green-600 hover:bg-green-700 border-0"
+                                    : "border-green-200 text-green-700 hover:bg-green-50"
+                                }`}
+                                disabled={isSavingThis}
+                                onClick={() => markStatus(emp.id, "Present")}
+                              >
+                                {isSavingThis ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                ) : (
+                                  "P"
+                                )}
+                              </Button>
+                              <Button
+                                data-ocid={`attendance.absent.button.${idx + 1}`}
+                                size="sm"
+                                variant={
+                                  status === "Absent" ? "default" : "outline"
+                                }
+                                className={`h-7 text-xs px-2.5 ${
+                                  status === "Absent"
+                                    ? "bg-red-500 hover:bg-red-600 border-0"
+                                    : "border-red-200 text-red-600 hover:bg-red-50"
+                                }`}
+                                disabled={isSavingThis}
+                                onClick={() => markStatus(emp.id, "Absent")}
+                              >
+                                {isSavingThis ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                ) : (
+                                  "A"
+                                )}
+                              </Button>
+                            </div>
+                          </TableCell>
+                        )}
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
